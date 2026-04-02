@@ -1,0 +1,15 @@
+[workspace]
+name = "rust_marimo_portal"
+version = "0.1.0"
+description = "Marimo Application Launcher GUI built with Rust/egui"
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[dependencies]
+rust = ">=1.85"
+pkg-config = ">=0.29"
+marimo = ">=0.21.1,<0.22"
+
+[tasks]
+debug = "cargo run"
+gui = "cargo run --release"
