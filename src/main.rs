@@ -2,7 +2,9 @@ use eframe::egui;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
-use std::process::Command;
+use std::io::{BufRead, BufReader};
+use std::process::{Command, Stdio};
+use std::thread;
 use std::time::Instant;
 
 const JSON_PATH: &str =
@@ -72,7 +74,7 @@ fn load_applications() -> Vec<(String, AppEntry)> {
 
 fn main() -> eframe::Result {
     let mut options = eframe::NativeOptions::default();
-    options.viewport = options.viewport.with_inner_size(egui::vec2(500.0, 800.0));
+    options.viewport = options.viewport.with_inner_size(egui::vec2(500.0, 1100.0));
     eframe::run_native(
         "General Tools",
         options,
@@ -161,10 +163,42 @@ impl eframe::App for MyApp {
                                 let app = &self.applications[idx];
                                 let marimo_bin = &app.1.marimo_path;
                                 println!("Launching: {} run {}", marimo_bin, &app.1.path);
-                                let _ = Command::new(marimo_bin)
+                                match Command::new(marimo_bin)
                                     .arg("run")
                                     .arg(&app.1.path)
-                                    .spawn();
+                                    .arg("--headless")
+                                    .stdout(Stdio::piped())
+                                    .stderr(Stdio::piped())
+                                    .spawn()
+                                {
+                                    Ok(mut child) => {
+                                        let stdout = child.stdout.take();
+                                        let stderr = child.stderr.take();
+                                        for stream in [stdout.map(|s| Box::new(s) as Box<dyn std::io::Read + Send>), stderr.map(|s| Box::new(s) as Box<dyn std::io::Read + Send>)].into_iter().flatten() {
+                                            thread::spawn(move || {
+                                                let reader = BufReader::new(stream);
+                                                let mut launched = false;
+                                                for line in reader.lines().map_while(Result::ok) {
+                                                    println!("{}", line);
+                                                    if !launched {
+                                                        if let Some(start) = line.find("http://") {
+                                                            let url: String = line[start..]
+                                                                .chars()
+                                                                .take_while(|c| !c.is_whitespace())
+                                                                .collect();
+                                                            println!("Opening {} in firefox", url);
+                                                            let _ = Command::new("firefox").arg(&url).spawn();
+                                                            launched = true;
+                                                        }
+                                                    }
+                                                }
+                                            });
+                                        }
+                                        // Detach: keep child running after we drop the handle.
+                                        std::mem::forget(child);
+                                    }
+                                    Err(e) => eprintln!("Failed to launch {}: {}", marimo_bin, e),
+                                }
                                 self.launch_time = Some(Instant::now());
                             }
                         }
@@ -191,9 +225,11 @@ impl eframe::App for MyApp {
                 .inner_margin(4.0)
                 .show(ui, |ui| {
                     egui::ScrollArea::vertical()
-                        .min_scrolled_height(200.0)
-                        .max_height(200.0)
+                        .auto_shrink([false, false])
+                        .min_scrolled_height(400.0)
+                        .max_height(400.0)
                         .show(ui, |ui| {
+                            ui.set_height(400.0);
                             ui.set_width(ui.available_width());
                             for (i, (name, _)) in self.applications.iter().enumerate() {
                                 if ui
