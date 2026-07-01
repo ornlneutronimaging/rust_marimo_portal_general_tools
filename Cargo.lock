@@ -2543,6 +2543,7 @@ version = "0.1.0"
 dependencies = [
  "eframe",
  "image",
+ "libc",
  "serde",
  "serde_json",
 ]
