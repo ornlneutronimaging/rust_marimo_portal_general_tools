@@ -550,9 +550,10 @@ impl eframe::App for MyApp {
                 }
 
                 // Bottom-left corner utility: kill stuck browser sessions.
+                // Same button as the Jupyter notebooks portal.
                 // Overlaid with `put` so the primary action stays centered;
                 // vertically centered on the primary button's row (36 px tall).
-                let btn_size = egui::vec2(30.0, 30.0);
+                let btn_size = egui::vec2(150.0, 28.0);
                 let btn_rect = egui::Rect::from_center_size(
                     egui::pos2(
                         ui.min_rect().left() + btn_size.x / 2.0,
@@ -564,10 +565,11 @@ impl eframe::App for MyApp {
                     .put(
                         btn_rect,
                         egui::Button::new(
-                            egui::RichText::new("\u{1F480}")
-                                .size(16.0)
-                                .color(theme::DANGER),
-                        ),
+                            egui::RichText::new("\u{1F527} Fix browser issue")
+                                .color(theme::TEXT_WHITE),
+                        )
+                        .fill(egui::Color32::from_rgb(138, 43, 226))
+                        .corner_radius(6.0),
                     )
                     .on_hover_text("Kill stuck browser sessions");
                 if resp.clicked() {
