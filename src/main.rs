@@ -1,3 +1,5 @@
+mod theme;
+
 use eframe::egui;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -7,14 +9,19 @@ use std::io::{BufRead, BufReader};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::Instant;
 
 const JSON_PATH: &str =
     "/SNS/VENUS/shared/software/menu/list_marimo_general_users_applications.json";
 const VENUS_ROOT: &str = "/SNS/VENUS";
+/// VENUS imaging logo shown in the header's top-right (branding slot).
+const LOGO_PATH: &str = "/SNS/VENUS/shared/software/logos/logo_with_green_neutron_rays.png";
 // Directories that must never be copied into the user's IPTS folder.
 const SKIP_DIRS: &[&str] = &["__pycache__", "__marimo__"];
+/// Maintenance script that lists and kills stuck browser sessions.
+const FIX_BROWSER_SCRIPT: &str = "/SNS/VENUS/shared/software/bin/list_and_fix_running_browser.sh";
 
 struct AppEntry {
     description: String,
@@ -28,6 +35,26 @@ struct IptsEntry {
     label: String,
     path: PathBuf,
     writable: bool,
+}
+
+/// A static logo image loaded into a texture, plus its aspect ratio for sizing.
+struct Logo {
+    texture: egui::TextureHandle,
+    aspect: f32, // width / height
+}
+
+impl Logo {
+    /// Load the image at `path` into a GPU texture. Returns `None` if the file
+    /// is missing or cannot be decoded.
+    fn load(ctx: &egui::Context, path: &str) -> Option<Self> {
+        let img = image::open(path).ok()?.to_rgba8();
+        let (w, h) = (img.width(), img.height());
+        let color_image =
+            egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], img.as_raw());
+        let texture = ctx.load_texture("logo", color_image, egui::TextureOptions::LINEAR);
+        let aspect = if h > 0 { w as f32 / h as f32 } else { 1.0 };
+        Some(Self { texture, aspect })
+    }
 }
 
 fn load_applications() -> Vec<(String, AppEntry)> {
@@ -208,9 +235,12 @@ fn main() -> eframe::Result {
     let mut options = eframe::NativeOptions::default();
     options.viewport = options.viewport.with_inner_size(egui::vec2(880.0, 780.0));
     eframe::run_native(
-        "General Tools",
+        "VENUS General Tools",
         options,
-        Box::new(|_cc| Ok(Box::new(MyApp::new()))),
+        Box::new(|cc| {
+            theme::apply(&cc.egui_ctx);
+            Ok(Box::new(MyApp::new()))
+        }),
     )
 }
 
@@ -226,6 +256,12 @@ struct MyApp {
     launch_time: Option<Instant>,
     launch_status: Option<(String, egui::Color32)>,
     screenshot_texture: Option<egui::TextureHandle>,
+    logo: Option<Logo>,
+    logo_tried: bool,
+    /// Message shown next to the browser-cleanup button.
+    cleanup_msg: Option<(String, egui::Color32)>,
+    /// Signals when the cleanup script exits, so the message can be cleared.
+    cleanup_rx: Option<mpsc::Receiver<()>>,
 }
 
 impl MyApp {
@@ -246,6 +282,10 @@ impl MyApp {
             launch_time: None,
             launch_status: None,
             screenshot_texture: None,
+            logo: None,
+            logo_tried: false,
+            cleanup_msg: None,
+            cleanup_rx: None,
         }
     }
 
@@ -279,7 +319,7 @@ impl MyApp {
         let notebook_name = match provision(app, &dest) {
             Ok(name) => name,
             Err(e) => {
-                self.launch_status = Some((e, egui::Color32::RED));
+                self.launch_status = Some((e, theme::DANGER));
                 return;
             }
         };
@@ -334,12 +374,39 @@ impl MyApp {
                 self.launch_time = Some(Instant::now());
                 self.launch_status = Some((
                     format!("Provisioned {}", dest.display()),
-                    egui::Color32::from_rgb(46, 160, 67),
+                    theme::SUCCESS,
                 ));
             }
             Err(e) => {
                 self.launch_status =
-                    Some((format!("Failed to launch {}: {}", marimo_bin, e), egui::Color32::RED));
+                    Some((format!("Failed to launch {}: {}", marimo_bin, e), theme::DANGER));
+            }
+        }
+    }
+
+    /// Run the maintenance script that kills stuck browser sessions.
+    fn kill_stuck_browsers(&mut self) {
+        match Command::new(FIX_BROWSER_SCRIPT).arg("kill").spawn() {
+            Ok(mut child) => {
+                // Reap the child in the background and signal the UI when it
+                // exits so the status message can be cleared.
+                let (tx, rx) = mpsc::channel();
+                thread::spawn(move || {
+                    let _ = child.wait();
+                    let _ = tx.send(());
+                });
+                self.cleanup_rx = Some(rx);
+                self.cleanup_msg = Some((
+                    "Killing stuck browser sessions\u{2026}".to_string(),
+                    theme::SUCCESS,
+                ));
+            }
+            Err(e) => {
+                self.cleanup_rx = None;
+                self.cleanup_msg = Some((
+                    format!("Failed to run {}: {}", FIX_BROWSER_SCRIPT, e),
+                    theme::DANGER,
+                ));
             }
         }
     }
@@ -347,18 +414,97 @@ impl MyApp {
 
 impl eframe::App for MyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let mut visuals = egui::Visuals::dark();
-        visuals.panel_fill = egui::Color32::BLACK;
-        visuals.window_fill = egui::Color32::BLACK;
-        ctx.set_visuals(visuals);
+        // Theme is installed once at startup (see `theme::apply`).
 
-        // Use egui's default (small) fonts, matching the jupyter reference portal.
+        // Load the logo once, on the first frame (needs the context).
+        if !self.logo_tried {
+            self.logo = Logo::load(ctx, LOGO_PATH);
+            self.logo_tried = true;
+        }
+
+        // Branded header (Coefficient "Header" pattern, branding slot): a
+        // full-width rich ORNL Green banner with a white title provides strong
+        // brand presence, with the VENUS imaging logo in the top-right corner.
+        egui::TopBottomPanel::top("header")
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::PRIMARY_RICH)
+                    .inner_margin(egui::Margin {
+                        left: 16,
+                        right: 16,
+                        top: 8,
+                        bottom: 8,
+                    }),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    // Title with a soft drop shadow: egui has no text shadow, so
+                    // paint the text twice — a dark offset copy behind the white.
+                    let title = "VENUS General Tools";
+                    let font = egui::FontId::proportional(28.0);
+                    let shadow_offset = egui::vec2(2.0, 2.0);
+                    let galley = ui.painter().layout_no_wrap(
+                        title.to_string(),
+                        font.clone(),
+                        theme::TEXT_WHITE,
+                    );
+                    let (rect, _) = ui.allocate_exact_size(
+                        galley.size() + shadow_offset,
+                        egui::Sense::hover(),
+                    );
+                    let pos = rect.min;
+                    ui.painter().text(
+                        pos + shadow_offset,
+                        egui::Align2::LEFT_TOP,
+                        title,
+                        font.clone(),
+                        egui::Color32::from_black_alpha(140),
+                    );
+                    ui.painter().text(
+                        pos,
+                        egui::Align2::LEFT_TOP,
+                        title,
+                        font,
+                        theme::TEXT_WHITE,
+                    );
+                    if let Some(logo) = &self.logo {
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                let height = 44.0;
+                                let size = egui::vec2(height * logo.aspect, height);
+                                let (rect, _) =
+                                    ui.allocate_exact_size(size, egui::Sense::hover());
+                                let uv = egui::Rect::from_min_max(
+                                    egui::pos2(0.0, 0.0),
+                                    egui::pos2(1.0, 1.0),
+                                );
+                                let shadow_offset = egui::vec2(2.0, 2.0);
+                                // Drop shadow: the texture tinted black draws its
+                                // alpha as a dark silhouette behind the logo.
+                                ui.painter().image(
+                                    logo.texture.id(),
+                                    rect.translate(shadow_offset),
+                                    uv,
+                                    egui::Color32::from_black_alpha(140),
+                                );
+                                ui.painter().image(
+                                    logo.texture.id(),
+                                    rect,
+                                    uv,
+                                    egui::Color32::WHITE,
+                                );
+                            },
+                        );
+                    }
+                });
+            });
 
         // Bottom panel with launch button (spans the full width).
         egui::TopBottomPanel::bottom("bottom_panel")
             .frame(
                 egui::Frame::new()
-                    .fill(egui::Color32::BLACK)
+                    .fill(theme::SURFACE_BASE)
                     .inner_margin(12.0),
             )
             .show(ctx, |ui| {
@@ -371,16 +517,20 @@ impl eframe::App for MyApp {
                     let ready = self.selected.is_some() && self.ipts_selected.is_some();
 
                     if launching {
-                        ui.add_enabled(false, egui::Button::new("\u{231b} Launching..."));
+                        ui.add_enabled(
+                            false,
+                            theme::primary_button("\u{231b} Launching\u{2026}"),
+                        );
                         ctx.request_repaint_after(std::time::Duration::from_millis(100));
                     } else if ready {
-                        if ui.button("Launch this application").clicked() {
+                        // Primary action: ORNL Green, title-case label, no punctuation.
+                        if ui.add(theme::primary_button("Launch Application")).clicked() {
                             self.launch();
                         }
                     } else {
                         ui.add_enabled(
                             false,
-                            egui::Button::new("Select an IPTS and an application"),
+                            egui::Button::new("Select an IPTS and an Application"),
                         );
                     }
 
@@ -388,6 +538,50 @@ impl eframe::App for MyApp {
                         ui.colored_label(*color, msg);
                     }
                 });
+
+                // Clear the cleanup message once the script has finished.
+                if let Some(rx) = &self.cleanup_rx {
+                    if rx.try_recv().is_ok() {
+                        self.cleanup_rx = None;
+                        self.cleanup_msg = None;
+                    } else {
+                        ctx.request_repaint_after(std::time::Duration::from_millis(200));
+                    }
+                }
+
+                // Bottom-left corner utility: kill stuck browser sessions.
+                // Overlaid with `put` so the primary action stays centered;
+                // vertically centered on the primary button's row (36 px tall).
+                let btn_size = egui::vec2(30.0, 30.0);
+                let btn_rect = egui::Rect::from_center_size(
+                    egui::pos2(
+                        ui.min_rect().left() + btn_size.x / 2.0,
+                        ui.min_rect().top() + 18.0,
+                    ),
+                    btn_size,
+                );
+                let resp = ui
+                    .put(
+                        btn_rect,
+                        egui::Button::new(
+                            egui::RichText::new("\u{1F480}")
+                                .size(16.0)
+                                .color(theme::DANGER),
+                        ),
+                    )
+                    .on_hover_text("Kill stuck browser sessions");
+                if resp.clicked() {
+                    self.kill_stuck_browsers();
+                }
+                if let Some((msg, color)) = &self.cleanup_msg {
+                    ui.painter().text(
+                        btn_rect.right_center() + egui::vec2(8.0, 0.0),
+                        egui::Align2::LEFT_CENTER,
+                        msg,
+                        egui::TextStyle::Body.resolve(ui.style()),
+                        *color,
+                    );
+                }
             });
 
         // Left panel: IPTS selection.
@@ -396,20 +590,20 @@ impl eframe::App for MyApp {
             .exact_width(300.0)
             .frame(
                 egui::Frame::new()
-                    .fill(egui::Color32::BLACK)
+                    .fill(theme::SURFACE_BASE)
                     .inner_margin(12.0),
             )
             .show(ctx, |ui| {
-                ui.strong("Select your IPTS");
+                ui.label(theme::section_heading("Select your IPTS"));
 
                 if let Some(err) = &self.ipts_error {
-                    ui.colored_label(egui::Color32::RED, err);
+                    ui.colored_label(theme::DANGER, err);
                 }
                 let writable_count = self.ipts_entries.iter().filter(|e| e.writable).count();
-                ui.label(format!(
-                    "You have write access to {} IPTS at VENUS",
-                    writable_count
-                ));
+                ui.colored_label(
+                    theme::TEXT_EMPHASIS,
+                    format!("You have write access to {} IPTS at VENUS", writable_count),
+                );
 
                 // Manual IPTS entry.
                 ui.horizontal(|ui| {
@@ -425,7 +619,7 @@ impl eframe::App for MyApp {
                             self.manual_ipts_msg = None;
                         } else if trimmed.parse::<u64>().is_err() {
                             self.manual_ipts_msg =
-                                Some(("Enter digits only".to_string(), egui::Color32::RED));
+                                Some(("Enter digits only".to_string(), theme::DANGER));
                         } else {
                             let target = format!("IPTS-{}", trimmed);
                             let found = self
@@ -444,12 +638,12 @@ impl eframe::App for MyApp {
                                 Some((_, false)) => {
                                     self.manual_ipts_msg = Some((
                                         format!("{} found but no write access", target),
-                                        egui::Color32::from_rgb(200, 120, 0),
+                                        theme::WARNING,
                                     ));
                                 }
                                 None => {
                                     self.manual_ipts_msg =
-                                        Some((format!("{} not found", target), egui::Color32::RED));
+                                        Some((format!("{} not found", target), theme::DANGER));
                                 }
                             }
                         }
@@ -462,11 +656,7 @@ impl eframe::App for MyApp {
                 ui.add_space(6.0);
 
                 // IPTS list fills the remaining panel height.
-                egui::Frame::new()
-                    .fill(egui::Color32::from_rgb(25, 25, 30))
-                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(80, 80, 100)))
-                    .corner_radius(4.0)
-                    .inner_margin(4.0)
+                theme::container_frame()
                     .show(ui, |ui| {
                         egui::ScrollArea::vertical()
                             .auto_shrink([false, false])
@@ -514,17 +704,10 @@ impl eframe::App for MyApp {
 
             let prev_selected = self.selected;
 
-            ui.strong("Select your application");
+            ui.label(theme::section_heading("Select your application"));
 
             // Application list.
-            egui::Frame::new()
-                .fill(egui::Color32::from_rgb(25, 25, 30))
-                .stroke(egui::Stroke::new(
-                    1.0,
-                    egui::Color32::from_rgb(80, 80, 100),
-                ))
-                .corner_radius(4.0)
-                .inner_margin(4.0)
+            theme::container_frame()
                 .show(ui, |ui| {
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
@@ -560,11 +743,8 @@ impl eframe::App for MyApp {
                 if !desc.is_empty() {
                     ui.add_space(5.0);
                     egui::Frame::new()
-                        .fill(egui::Color32::from_rgb(25, 25, 30))
-                        .stroke(egui::Stroke::new(
-                            1.0,
-                            egui::Color32::from_rgb(80, 80, 100),
-                        ))
+                        .fill(theme::SURFACE_CONTAINER)
+                        .stroke(egui::Stroke::new(1.0, theme::BORDER_SUBTLE))
                         .corner_radius(6.0)
                         .inner_margin(12.0)
                         .show(ui, |ui| {
