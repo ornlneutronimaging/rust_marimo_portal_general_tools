@@ -15,9 +15,22 @@ use std::time::Instant;
 
 const JSON_PATH: &str =
     "/SNS/VENUS/shared/software/menu/list_marimo_general_users_applications.json";
-const VENUS_ROOT: &str = "/SNS/VENUS";
-/// VENUS imaging logo shown in the header's top-right (branding slot).
-const LOGO_PATH: &str = "/SNS/VENUS/shared/software/logos/logo_with_green_neutron_rays.png";
+/// Imaging instruments the portal can provision into:
+/// (display name, IPTS root, header logo). MARS is CG-1D at HFIR; it has no
+/// instrument-specific logo, so it uses the generic ORNL Neutron Imaging one.
+/// VENUS (index 0) is the default.
+const INSTRUMENTS: &[(&str, &str, &str)] = &[
+    (
+        "VENUS",
+        "/SNS/VENUS",
+        "/SNS/VENUS/shared/software/logos/logo_with_green_neutron_rays.png",
+    ),
+    (
+        "MARS",
+        "/HFIR/CG1D",
+        "/SNS/VENUS/shared/software/logos/ImagingLogo.png",
+    ),
+];
 // Directories that must never be copied into the user's IPTS folder.
 const SKIP_DIRS: &[&str] = &["__pycache__", "__marimo__"];
 /// Maintenance script that lists and kills stuck browser sessions.
@@ -161,7 +174,7 @@ fn list_ipts(root: &Path) -> Result<Vec<IptsEntry>, String> {
     Ok(ipts.into_iter().map(|(_, e)| e).collect())
 }
 
-/// `/SNS/VENUS/<ipts>/shared/notebooks/imaging_marimo_<user>`
+/// `<instrument root>/<ipts>/shared/notebooks/imaging_marimo_<user>`
 fn destination_for(ipts: &IptsEntry) -> PathBuf {
     ipts.path
         .join("shared")
@@ -235,7 +248,7 @@ fn main() -> eframe::Result {
     let mut options = eframe::NativeOptions::default();
     options.viewport = options.viewport.with_inner_size(egui::vec2(880.0, 780.0));
     eframe::run_native(
-        "VENUS General Tools",
+        &format!("{} General Tools", INSTRUMENTS[0].0),
         options,
         Box::new(|cc| {
             theme::apply(&cc.egui_ctx);
@@ -247,6 +260,8 @@ fn main() -> eframe::Result {
 struct MyApp {
     applications: Vec<(String, AppEntry)>,
     selected: Option<usize>,
+    /// Index into `INSTRUMENTS` of the currently selected instrument.
+    instrument: usize,
     ipts_entries: Vec<IptsEntry>,
     ipts_error: Option<String>,
     ipts_selected: Option<usize>,
@@ -257,7 +272,8 @@ struct MyApp {
     launch_status: Option<(String, egui::Color32)>,
     screenshot_texture: Option<egui::TextureHandle>,
     logo: Option<Logo>,
-    logo_tried: bool,
+    /// Instrument whose logo is currently loaded (`None` = not loaded yet).
+    logo_instrument: Option<usize>,
     /// Message shown next to the browser-cleanup button.
     cleanup_msg: Option<(String, egui::Color32)>,
     /// Signals when the cleanup script exits, so the message can be cleared.
@@ -266,15 +282,12 @@ struct MyApp {
 
 impl MyApp {
     fn new() -> Self {
-        let (ipts_entries, ipts_error) = match list_ipts(Path::new(VENUS_ROOT)) {
-            Ok(list) => (list, None),
-            Err(e) => (Vec::new(), Some(e)),
-        };
-        Self {
+        let mut app = Self {
             applications: load_applications(),
             selected: None,
-            ipts_entries,
-            ipts_error,
+            instrument: 0, // VENUS by default
+            ipts_entries: Vec::new(),
+            ipts_error: None,
             ipts_selected: None,
             manual_ipts: String::new(),
             manual_ipts_msg: None,
@@ -283,10 +296,28 @@ impl MyApp {
             launch_status: None,
             screenshot_texture: None,
             logo: None,
-            logo_tried: false,
+            logo_instrument: None,
             cleanup_msg: None,
             cleanup_rx: None,
-        }
+        };
+        app.reload_ipts();
+        app
+    }
+
+    /// Rebuild the IPTS list from the selected instrument's root and clear any
+    /// selection/state tied to the previous instrument.
+    fn reload_ipts(&mut self) {
+        let root = Path::new(INSTRUMENTS[self.instrument].1);
+        let (ipts_entries, ipts_error) = match list_ipts(root) {
+            Ok(list) => (list, None),
+            Err(e) => (Vec::new(), Some(e)),
+        };
+        self.ipts_entries = ipts_entries;
+        self.ipts_error = ipts_error;
+        self.ipts_selected = None;
+        self.manual_ipts.clear();
+        self.manual_ipts_msg = None;
+        self.launch_status = None;
     }
 
     fn load_screenshot(&mut self, ctx: &egui::Context, path: &str) {
@@ -416,10 +447,11 @@ impl eframe::App for MyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Theme is installed once at startup (see `theme::apply`).
 
-        // Load the logo once, on the first frame (needs the context).
-        if !self.logo_tried {
-            self.logo = Logo::load(ctx, LOGO_PATH);
-            self.logo_tried = true;
+        // (Re)load the logo whenever the selected instrument's logo isn't the
+        // one on screen — first frame and after an instrument switch.
+        if self.logo_instrument != Some(self.instrument) {
+            self.logo = Logo::load(ctx, INSTRUMENTS[self.instrument].2);
+            self.logo_instrument = Some(self.instrument);
         }
 
         // Branded header (Coefficient "Header" pattern, branding slot): a
@@ -440,7 +472,8 @@ impl eframe::App for MyApp {
                 ui.horizontal(|ui| {
                     // Title with a soft drop shadow: egui has no text shadow, so
                     // paint the text twice — a dark offset copy behind the white.
-                    let title = "VENUS General Tools";
+                    let title = format!("{} General Tools", INSTRUMENTS[self.instrument].0);
+                    let title = title.as_str();
                     let font = egui::FontId::proportional(28.0);
                     let shadow_offset = egui::vec2(2.0, 2.0);
                     let galley = ui.painter().layout_no_wrap(
@@ -496,6 +529,44 @@ impl eframe::App for MyApp {
                                 );
                             },
                         );
+                    }
+                });
+            });
+
+        // Instrument selector, directly under the header: switching instrument
+        // rescans that instrument's root and rebuilds the IPTS list.
+        egui::TopBottomPanel::top("instrument_bar")
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::SURFACE_WEAK)
+                    .inner_margin(egui::Margin {
+                        left: 16,
+                        right: 16,
+                        top: 8,
+                        bottom: 8,
+                    }),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(theme::section_heading("Instrument:"));
+                    let mut changed = false;
+                    for (i, (name, _, _)) in INSTRUMENTS.iter().enumerate() {
+                        if ui
+                            .selectable_label(self.instrument == i, *name)
+                            .clicked()
+                            && self.instrument != i
+                        {
+                            self.instrument = i;
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        self.reload_ipts();
+                        // Keep the OS window title in sync with the header.
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!(
+                            "{} General Tools",
+                            INSTRUMENTS[self.instrument].0
+                        )));
                     }
                 });
             });
@@ -604,7 +675,11 @@ impl eframe::App for MyApp {
                 let writable_count = self.ipts_entries.iter().filter(|e| e.writable).count();
                 ui.colored_label(
                     theme::TEXT_EMPHASIS,
-                    format!("You have write access to {} IPTS at VENUS", writable_count),
+                    format!(
+                        "You have write access to {} IPTS at {}",
+                        writable_count,
+                        INSTRUMENTS[self.instrument].0
+                    ),
                 );
 
                 // Manual IPTS entry.
