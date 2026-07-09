@@ -7,6 +7,7 @@ use std::ffi::CString;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -219,6 +220,15 @@ fn provision(app: &AppEntry, dest: &Path) -> Result<PathBuf, String> {
         .ok_or_else(|| format!("Cannot determine source folder for {}", app.path))?;
 
     fs::create_dir_all(dest).map_err(|e| format!("create {}: {e}", dest.display()))?;
+    // Everybody must be able to read/write/traverse the notebooks folders.
+    // The parent `notebooks` dir may pre-exist and belong to another user,
+    // in which case chmod fails and we leave it as-is.
+    let open_perms = fs::Permissions::from_mode(0o777);
+    if let Some(notebooks_dir) = dest.parent() {
+        let _ = fs::set_permissions(notebooks_dir, open_perms.clone());
+    }
+    fs::set_permissions(dest, open_perms)
+        .map_err(|e| format!("chmod 777 {}: {e}", dest.display()))?;
 
     // Copy the notebook itself.
     let dst_notebook = dest.join(&file_name);
