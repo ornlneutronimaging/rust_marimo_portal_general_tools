@@ -394,6 +394,11 @@ impl MyApp {
             .arg("run")
             .arg(&notebook_name)
             .arg("--headless")
+            // Provisioned IPTS folders have no pyproject.toml/.marimo.toml in
+            // their ancestry, so marimo would fall back to its 8 MB default;
+            // the branding cell alone is ~8.5 MB and trips the truncation
+            // banner at startup.
+            .env("MARIMO_OUTPUT_MAX_BYTES", "20000000")
             .current_dir(&dest)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
