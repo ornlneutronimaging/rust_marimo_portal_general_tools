@@ -279,6 +279,7 @@ fn main() -> eframe::Result {
         &format!("{} General Tools", INSTRUMENTS[0].0),
         options,
         Box::new(|cc| {
+            cc.egui_ctx.set_theme(theme::load());
             theme::apply(&cc.egui_ctx);
             Ok(Box::new(MyApp::new()))
         }),
@@ -571,7 +572,7 @@ impl eframe::App for MyApp {
         egui::TopBottomPanel::top("instrument_bar")
             .frame(
                 egui::Frame::new()
-                    .fill(theme::SURFACE_WEAK)
+                    .fill(theme::surface_weak(&ctx.style().visuals))
                     .inner_margin(egui::Margin {
                         left: 16,
                         right: 16,
@@ -601,6 +602,8 @@ impl eframe::App for MyApp {
                             INSTRUMENTS[self.instrument].0
                         )));
                     }
+                    ui.separator();
+                    theme::toggle_button(ui);
                 });
             });
 
@@ -608,7 +611,7 @@ impl eframe::App for MyApp {
         egui::TopBottomPanel::bottom("bottom_panel")
             .frame(
                 egui::Frame::new()
-                    .fill(theme::SURFACE_BASE)
+                    .fill(theme::surface_base(&ctx.style().visuals))
                     .inner_margin(12.0),
             )
             .show(ctx, |ui| {
@@ -696,7 +699,7 @@ impl eframe::App for MyApp {
             .exact_width(300.0)
             .frame(
                 egui::Frame::new()
-                    .fill(theme::SURFACE_BASE)
+                    .fill(theme::surface_base(&ctx.style().visuals))
                     .inner_margin(12.0),
             )
             .show(ctx, |ui| {
@@ -707,7 +710,7 @@ impl eframe::App for MyApp {
                 }
                 let writable_count = self.ipts_entries.iter().filter(|e| e.writable).count();
                 ui.colored_label(
-                    theme::TEXT_EMPHASIS,
+                    theme::text_emphasis(ui.visuals()),
                     format!(
                         "You have write access to {} IPTS at {}",
                         writable_count,
@@ -766,7 +769,7 @@ impl eframe::App for MyApp {
                 ui.add_space(6.0);
 
                 // IPTS list fills the remaining panel height.
-                theme::container_frame()
+                theme::container_frame(ui.visuals())
                     .show(ui, |ui| {
                         egui::ScrollArea::vertical()
                             .auto_shrink([false, false])
@@ -817,7 +820,7 @@ impl eframe::App for MyApp {
             ui.label(theme::section_heading("Select your application"));
 
             // Application list.
-            theme::container_frame()
+            theme::container_frame(ui.visuals())
                 .show(ui, |ui| {
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
@@ -853,8 +856,8 @@ impl eframe::App for MyApp {
                 if !desc.is_empty() {
                     ui.add_space(5.0);
                     egui::Frame::new()
-                        .fill(theme::SURFACE_CONTAINER)
-                        .stroke(egui::Stroke::new(1.0, theme::BORDER_SUBTLE))
+                        .fill(theme::surface_container(ui.visuals()))
+                        .stroke(egui::Stroke::new(1.0, theme::border_subtle(ui.visuals())))
                         .corner_radius(6.0)
                         .inner_margin(12.0)
                         .show(ui, |ui| {
