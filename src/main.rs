@@ -42,6 +42,16 @@ struct AppEntry {
     path: String,
     marimo_path: String,
     screenshot: String,
+    /// Optional section name ("category" key in the JSON). Entries sharing a
+    /// category are grouped under a collapsible section in the list.
+    category: String,
+}
+
+/// One row of the application list: either a standalone app or a named
+/// section containing several apps. Indices point into `MyApp::applications`.
+enum DisplayItem {
+    App(usize),
+    Section(String, Vec<usize>),
 }
 
 /// An IPTS the current user can see under the instrument root.
@@ -113,6 +123,11 @@ fn load_applications() -> Vec<(String, AppEntry)> {
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
+            let category = val
+                .get("category")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             (
                 name,
                 AppEntry {
@@ -120,10 +135,31 @@ fn load_applications() -> Vec<(String, AppEntry)> {
                     path,
                     marimo_path,
                     screenshot,
+                    category,
                 },
             )
         })
         .collect()
+}
+
+/// Group the flat application list for display: uncategorized apps stay
+/// standalone rows, categorized apps collapse under one section per category,
+/// and everything (apps and sections alike) sorts alphabetically.
+fn build_display(applications: &[(String, AppEntry)]) -> Vec<DisplayItem> {
+    let mut sections: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    let mut rows: Vec<(String, DisplayItem)> = Vec::new();
+    for (i, (name, entry)) in applications.iter().enumerate() {
+        if entry.category.is_empty() {
+            rows.push((name.clone(), DisplayItem::App(i)));
+        } else {
+            sections.entry(entry.category.clone()).or_default().push(i);
+        }
+    }
+    for (category, indices) in sections {
+        rows.push((category.clone(), DisplayItem::Section(category, indices)));
+    }
+    rows.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+    rows.into_iter().map(|(_, item)| item).collect()
 }
 
 fn can_access(path: &Path) -> bool {
@@ -288,6 +324,8 @@ fn main() -> eframe::Result {
 
 struct MyApp {
     applications: Vec<(String, AppEntry)>,
+    /// Grouped view of `applications` (sections + standalone rows).
+    app_display: Vec<DisplayItem>,
     selected: Option<usize>,
     /// Index into `INSTRUMENTS` of the currently selected instrument.
     instrument: usize,
@@ -311,8 +349,11 @@ struct MyApp {
 
 impl MyApp {
     fn new() -> Self {
+        let applications = load_applications();
+        let app_display = build_display(&applications);
         let mut app = Self {
-            applications: load_applications(),
+            applications,
+            app_display,
             selected: None,
             instrument: 0, // VENUS by default
             ipts_entries: Vec::new(),
@@ -828,14 +869,35 @@ impl eframe::App for MyApp {
                         .id_salt("app_scroll")
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width());
-                            for (i, (name, _)) in self.applications.iter().enumerate() {
+                            let mut clicked = None;
+                            let mut app_row = |ui: &mut egui::Ui, i: usize| {
+                                let name = &self.applications[i].0;
                                 if ui
                                     .selectable_label(self.selected == Some(i), name)
                                     .clicked()
                                 {
-                                    self.selected = Some(i);
-                                    self.launch_status = None;
+                                    clicked = Some(i);
                                 }
+                            };
+                            for item in &self.app_display {
+                                match item {
+                                    DisplayItem::App(i) => app_row(ui, *i),
+                                    DisplayItem::Section(category, indices) => {
+                                        egui::CollapsingHeader::new(
+                                            egui::RichText::new(category).strong(),
+                                        )
+                                        .default_open(true)
+                                        .show(ui, |ui| {
+                                            for &i in indices {
+                                                app_row(ui, i);
+                                            }
+                                        });
+                                    }
+                                }
+                            }
+                            if let Some(i) = clicked {
+                                self.selected = Some(i);
+                                self.launch_status = None;
                             }
                         });
                 });
