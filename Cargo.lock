@@ -2542,6 +2542,7 @@ name = "rust_marimo_portal_general_tools"
 version = "0.2.0"
 dependencies = [
  "eframe",
+ "egui",
  "image",
  "libc",
  "serde",

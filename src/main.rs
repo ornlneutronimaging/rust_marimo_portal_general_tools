@@ -1,4 +1,5 @@
 mod theme;
+mod zoom;
 
 use eframe::egui;
 use serde_json::Value;
@@ -317,6 +318,7 @@ fn main() -> eframe::Result {
         Box::new(|cc| {
             cc.egui_ctx.set_theme(theme::load());
             theme::apply(&cc.egui_ctx);
+            cc.egui_ctx.set_zoom_factor(zoom::load());
             Ok(Box::new(MyApp::new()))
         }),
     )
@@ -645,6 +647,7 @@ impl eframe::App for MyApp {
                     }
                     ui.separator();
                     theme::toggle_button(ui);
+                    zoom::toggle_button(ui);
                 });
             });
 
