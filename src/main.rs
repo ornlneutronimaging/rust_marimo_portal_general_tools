@@ -36,7 +36,80 @@ const INSTRUMENTS: &[(&str, &str, &str)] = &[
 // Directories that must never be copied into the user's IPTS folder.
 const SKIP_DIRS: &[&str] = &["__pycache__", "__marimo__"];
 /// Maintenance script that lists and kills stuck browser sessions.
+/// Also run in `list` mode when the firefox we spawn fails: the profile lives
+/// on shared NFS/GPFS storage, so a firefox running on ANY analysis machine
+/// locks it — the scan shows WHERE (remote kills are unreliable, so the fix
+/// is closing the browser on that machine).
 const FIX_BROWSER_SCRIPT: &str = "/SNS/VENUS/shared/software/bin/list_and_fix_running_browser.sh";
+
+/// The scan report lists offending hosts as "[host] N process(es):" blocks.
+fn scan_found_processes(report: &str) -> bool {
+    report
+        .lines()
+        .any(|l| l.trim_start().starts_with('[') && l.contains("process(es):"))
+}
+
+/// Instant "where is my Firefox running" check: Firefox writes a `lock`
+/// symlink inside each profile pointing to "ip:+pid" of the owning process,
+/// so when the shared profile is locked by a session on ANOTHER machine the
+/// symlink names that machine directly — no SSH scan needed. Returns a
+/// report for the pop-up window, or None when no remote lock is held (a
+/// lock held by this machine is harmless: firefox just opens a new tab).
+fn firefox_remote_lock_report() -> Option<String> {
+    let home = std::env::var("HOME").ok()?;
+    let profiles = Path::new(&home).join(".mozilla/firefox");
+    let local_ips: Vec<String> = Command::new("hostname")
+        .arg("-I")
+        .output()
+        .ok()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut blocks = Vec::new();
+    for entry in fs::read_dir(&profiles).ok()?.flatten() {
+        let Ok(target) = fs::read_link(entry.path().join("lock")) else {
+            continue;
+        };
+        let target = target.to_string_lossy().into_owned();
+        let Some((ip, pid)) = target.split_once(":+") else {
+            continue;
+        };
+        if ip.starts_with("127.") || local_ips.iter().any(|l| l == ip) {
+            continue;
+        }
+        let host = Command::new("getent")
+            .args(["hosts", ip])
+            .output()
+            .ok()
+            .and_then(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .split_whitespace()
+                    .nth(1)
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| ip.to_owned());
+        blocks.push(format!(
+            "[{host}] ({ip}) firefox PID {pid} holds the profile lock\n    \
+             (profile {})\n    to close it from here:  ssh {host}  then  kill {pid}",
+            entry.file_name().to_string_lossy(),
+        ));
+    }
+    if blocks.is_empty() {
+        None
+    } else {
+        blocks.push(
+            "If Firefox is NOT actually running there, the lock is stale:\n    \
+             delete the 'lock' and '.parentlock' files in that profile folder\n    \
+             under ~/.mozilla/firefox/."
+                .to_owned(),
+        );
+        Some(blocks.join("\n\n"))
+    }
+}
 
 struct AppEntry {
     description: String,
@@ -347,12 +420,22 @@ struct MyApp {
     cleanup_msg: Option<(String, egui::Color32)>,
     /// Signals when the cleanup script exits, so the message can be cleared.
     cleanup_rx: Option<mpsc::Receiver<()>>,
+    /// The output-reader threads report a failed firefox spawn/exit here;
+    /// receiving triggers the cross-machine browser scan.
+    browser_fail_tx: mpsc::Sender<String>,
+    browser_fail_rx: mpsc::Receiver<String>,
+    /// Report channel of a running `FIX_BROWSER_SCRIPT list` scan.
+    scan_rx: Option<mpsc::Receiver<String>>,
+    /// The finished scan's report, shown in the pop-up window.
+    scan_output: Option<String>,
+    scan_window_open: bool,
 }
 
 impl MyApp {
     fn new() -> Self {
         let applications = load_applications();
         let app_display = build_display(&applications);
+        let (browser_fail_tx, browser_fail_rx) = mpsc::channel();
         let mut app = Self {
             applications,
             app_display,
@@ -371,6 +454,11 @@ impl MyApp {
             logo_instrument: None,
             cleanup_msg: None,
             cleanup_rx: None,
+            browser_fail_tx,
+            browser_fail_rx,
+            scan_rx: None,
+            scan_output: None,
+            scan_window_open: false,
         };
         app.reload_ipts();
         app
@@ -458,6 +546,7 @@ impl MyApp {
                 .into_iter()
                 .flatten()
                 {
+                    let fail_tx = self.browser_fail_tx.clone();
                     thread::spawn(move || {
                         let reader = BufReader::new(stream);
                         let mut launched = false;
@@ -470,7 +559,31 @@ impl MyApp {
                                         .take_while(|c| !c.is_whitespace())
                                         .collect();
                                     println!("Opening {} in firefox", url);
-                                    let _ = Command::new("firefox").arg(&url).spawn();
+                                    // Watch the spawned firefox: a non-zero
+                                    // exit means it could not open (typically
+                                    // "already running" — the shared profile
+                                    // is locked by another analysis machine);
+                                    // report it so the UI can scan for WHERE.
+                                    match Command::new("firefox").arg(&url).spawn() {
+                                        Ok(mut ff) => {
+                                            let tx = fail_tx.clone();
+                                            thread::spawn(move || {
+                                                if let Ok(status) = ff.wait() {
+                                                    if !status.success() {
+                                                        let _ = tx.send(
+                                                            "Firefox could not open the notebook"
+                                                                .to_string(),
+                                                        );
+                                                    }
+                                                }
+                                            });
+                                        }
+                                        Err(e) => {
+                                            let _ = fail_tx.send(format!(
+                                                "Could not start firefox: {e}"
+                                            ));
+                                        }
+                                    }
                                     launched = true;
                                 }
                             }
@@ -484,6 +597,20 @@ impl MyApp {
                     format!("Provisioned {}", dest.display()),
                     theme::SUCCESS,
                 ));
+                // Warn NOW when the shared profile is locked by another
+                // machine: the firefox we are about to spawn will only sit
+                // on its own "already running" dialog (and may never exit,
+                // so the failure→scan path would never fire).
+                if let Some(report) = firefox_remote_lock_report() {
+                    self.scan_output = Some(report);
+                    self.scan_window_open = true;
+                    self.launch_status = Some((
+                        "Your browser is already running on another machine \
+                         (see the report window)"
+                            .to_string(),
+                        theme::DANGER,
+                    ));
+                }
             }
             Err(e) => {
                 self.launch_status =
@@ -518,11 +645,97 @@ impl MyApp {
             }
         }
     }
+
+    /// Firefox failed to open: run `FIX_BROWSER_SCRIPT list -firefox` in a
+    /// background thread to find on which analysis machine the browser (or
+    /// the Jupyter keeping it alive) is already running.
+    fn start_browser_scan(&mut self, why: &str) {
+        if self.scan_rx.is_some() {
+            return; // one scan at a time
+        }
+        // The profile lock symlink answers instantly when present; only
+        // fall back to the (slow, SSH-based) scan when it says nothing.
+        if let Some(report) = firefox_remote_lock_report() {
+            self.scan_output = Some(report);
+            self.scan_window_open = true;
+            self.launch_status = Some((
+                format!("{why} — your browser is running on another machine (see the report window)"),
+                theme::DANGER,
+            ));
+            return;
+        }
+        if !Path::new(FIX_BROWSER_SCRIPT).is_file() {
+            self.launch_status = Some((
+                format!("{why} — your browser may be running on another analysis machine"),
+                theme::DANGER,
+            ));
+            return;
+        }
+        self.launch_status = Some((
+            format!("{why} — scanning the analysis machines for an already-running browser\u{2026}"),
+            theme::WARNING,
+        ));
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let report = match Command::new(FIX_BROWSER_SCRIPT)
+                .arg("list")
+                .arg("-firefox")
+                .output()
+            {
+                Ok(out) => {
+                    let stdout = String::from_utf8_lossy(&out.stdout);
+                    if stdout.trim().is_empty() {
+                        String::from_utf8_lossy(&out.stderr).into_owned()
+                    } else {
+                        // Drop the script's closing "Re-run with 'kill'" hint:
+                        // the window advises closing the browser on the listed
+                        // machine instead (remote kills are unreliable).
+                        match stdout.find("Re-run with 'kill'") {
+                            Some(pos) => stdout[..pos].trim_end().to_owned(),
+                            None => stdout.into_owned(),
+                        }
+                    }
+                }
+                Err(e) => format!("Could not run the scan script: {e}"),
+            };
+            let _ = tx.send(report);
+        });
+        self.scan_rx = Some(rx);
+    }
+
+    /// Poll the firefox-failure and scan channels; pop the report window when
+    /// the scan found the user's browser running somewhere.
+    fn poll_browser_scan(&mut self) {
+        if let Ok(why) = self.browser_fail_rx.try_recv() {
+            self.start_browser_scan(&why);
+        }
+        let Some(rx) = &self.scan_rx else { return };
+        let Ok(report) = rx.try_recv() else { return };
+        self.scan_rx = None;
+        if scan_found_processes(&report) {
+            self.scan_window_open = true;
+            self.launch_status = Some((
+                "Your browser is already running on another machine (see the report window)"
+                    .to_string(),
+                theme::DANGER,
+            ));
+        } else {
+            self.launch_status = Some((
+                "Firefox failed, but no already-running browser was found on the analysis machines"
+                    .to_string(),
+                theme::WARNING,
+            ));
+        }
+        self.scan_output = Some(report);
+    }
 }
 
 impl eframe::App for MyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Theme is installed once at startup (see `theme::apply`).
+
+        // Firefox-failure watcher / cross-machine browser scan.
+        self.poll_browser_scan();
 
         // (Re)load the logo whenever the selected instrument's logo isn't the
         // one on screen — first frame and after an instrument switch.
@@ -947,5 +1160,59 @@ impl eframe::App for MyApp {
                 }
             }
         });
+
+        // ------------------------- browser-running-elsewhere scan report ---
+        if self.scan_window_open {
+            let mut open = true;
+            egui::Window::new("Browser already running elsewhere")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(true)
+                .default_size([680.0, 440.0])
+                .show(ctx, |ui| {
+                    ui.label(
+                        egui::RichText::new(
+                            "Firefox cannot open the notebook on this machine: \
+                             your browser profile is on shared storage and is \
+                             locked by a session on the machine(s) listed below.",
+                        )
+                        .size(16.0),
+                    );
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "Log into that machine and close the browser (and \
+                             any Jupyter) there, then launch again. Remote \
+                             kills are unreliable — closing it on the machine \
+                             itself is what works.",
+                        )
+                        .size(16.0)
+                        .color(theme::text_emphasis(ui.visuals())),
+                    );
+                    ui.add_space(8.0);
+                    ui.separator();
+                    egui::ScrollArea::both()
+                        .id_salt("browser_scan_scroll")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new(
+                                    self.scan_output.as_deref().unwrap_or(""),
+                                )
+                                .monospace()
+                                .size(15.0),
+                            );
+                        });
+                });
+            if !open {
+                self.scan_window_open = false;
+            }
+        }
+
+        // Keep polling the failure/scan channels without mouse movement: the
+        // spawned firefox can fail well after the 5 s "Launching…" period.
+        if self.launch_time.is_some() || self.scan_rx.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_secs(1));
+        }
     }
 }
