@@ -120,6 +120,17 @@ struct AppEntry {
     /// Optional section name ("category" key in the JSON). Entries sharing a
     /// category are grouped under a collapsible section in the list.
     category: String,
+    /// Instruments the notebook applies to ("instruments" key in the JSON,
+    /// a list of `INSTRUMENTS` names). Empty = available everywhere. The
+    /// entry is shown disabled when the selected instrument is not listed.
+    instruments: Vec<String>,
+}
+
+impl AppEntry {
+    fn available_at(&self, instrument: &str) -> bool {
+        self.instruments.is_empty()
+            || self.instruments.iter().any(|i| i.eq_ignore_ascii_case(instrument))
+    }
 }
 
 /// One row of the application list: either a standalone app or a named
@@ -203,6 +214,17 @@ fn load_applications() -> Vec<(String, AppEntry)> {
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
+            let instruments = val
+                .get("instruments")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str())
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default();
             (
                 name,
                 AppEntry {
@@ -211,6 +233,7 @@ fn load_applications() -> Vec<(String, AppEntry)> {
                     marimo_path,
                     screenshot,
                     category,
+                    instruments,
                 },
             )
         })
@@ -524,6 +547,13 @@ impl MyApp {
     /// Rebuild the IPTS list from the selected instrument's root and clear any
     /// selection/state tied to the previous instrument.
     fn reload_ipts(&mut self) {
+        // Drop a selected application that the new instrument cannot use.
+        if let Some(idx) = self.selected {
+            if !self.app_available(idx) {
+                self.selected = None;
+                self.screenshot_texture = None;
+            }
+        }
         let root = Path::new(INSTRUMENTS[self.instrument].1);
         let (ipts_entries, ipts_error) = match list_ipts(root) {
             Ok(list) => (list, None),
@@ -535,6 +565,13 @@ impl MyApp {
         self.manual_ipts.clear();
         self.manual_ipts_msg = None;
         self.launch_status = None;
+    }
+
+    /// Whether application `idx` applies to the selected instrument.
+    fn app_available(&self, idx: usize) -> bool {
+        self.applications[idx]
+            .1
+            .available_at(INSTRUMENTS[self.instrument].0)
     }
 
     fn load_screenshot(&mut self, ctx: &egui::Context, path: &str) {
@@ -999,7 +1036,10 @@ impl eframe::App for MyApp {
                         .map(|t| t.elapsed().as_secs() < 5)
                         .unwrap_or(false);
 
-                    let ready = self.selected.is_some() && self.ipts_selected.is_some();
+                    let ready = self
+                        .selected
+                        .map_or(false, |idx| self.app_available(idx))
+                        && self.ipts_selected.is_some();
 
                     if launching {
                         ui.add_enabled(
@@ -1214,8 +1254,22 @@ impl eframe::App for MyApp {
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width());
                             let mut clicked = None;
+                            let instrument = INSTRUMENTS[self.instrument].0;
                             let mut app_row = |ui: &mut egui::Ui, i: usize| {
                                 let name = &self.applications[i].0;
+                                if !self.app_available(i) {
+                                    // Not for this instrument: grayed out,
+                                    // not selectable.
+                                    ui.add_enabled(
+                                        false,
+                                        egui::SelectableLabel::new(false, name),
+                                    )
+                                    .on_disabled_hover_text(format!(
+                                        "Not available at {}",
+                                        instrument
+                                    ));
+                                    return;
+                                }
                                 if ui
                                     .selectable_label(self.selected == Some(i), name)
                                     .clicked()
