@@ -35,11 +35,12 @@ const INSTRUMENTS: &[(&str, &str, &str)] = &[
 ];
 // Directories that must never be copied into the user's IPTS folder.
 const SKIP_DIRS: &[&str] = &["__pycache__", "__marimo__"];
-/// Maintenance script that lists and kills stuck browser sessions.
+/// Maintenance script that lists and kills stuck browser sessions (source in
+/// `scripts/` of this repo; deployed next to the portal binary).
 /// Also run in `list` mode when the firefox we spawn fails: the profile lives
 /// on shared NFS/GPFS storage, so a firefox running on ANY analysis machine
-/// locks it — the scan shows WHERE (remote kills are unreliable, so the fix
-/// is closing the browser on that machine).
+/// locks it — the scan shows WHERE. Both modes work over passwordless SSH,
+/// which the script sets up itself for users who have no SSH key yet.
 const FIX_BROWSER_SCRIPT: &str = "/SNS/VENUS/shared/software/bin/list_and_fix_running_browser.sh";
 
 /// The scan report lists offending hosts as "[host] N process(es):" blocks.
@@ -418,8 +419,8 @@ struct MyApp {
     logo_instrument: Option<usize>,
     /// Message shown next to the browser-cleanup button.
     cleanup_msg: Option<(String, egui::Color32)>,
-    /// Signals when the cleanup script exits, so the message can be cleared.
-    cleanup_rx: Option<mpsc::Receiver<()>>,
+    /// Delivers the cleanup script's report once it exits.
+    cleanup_rx: Option<mpsc::Receiver<String>>,
     /// The output-reader threads report a failed firefox spawn/exit here;
     /// receiving triggers the cross-machine browser scan.
     browser_fail_tx: mpsc::Sender<String>,
@@ -429,6 +430,61 @@ struct MyApp {
     /// The finished scan's report, shown in the pop-up window.
     scan_output: Option<String>,
     scan_window_open: bool,
+    /// Whether the pop-up shows a "browser found elsewhere" scan or the
+    /// result of the "Fix browser issue" kill run (different heading).
+    scan_window_kind: ScanWindowKind,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScanWindowKind {
+    /// Firefox failed to open: where is it already running?
+    Scan,
+    /// The user clicked "Fix browser issue": what did the kill run do?
+    Kill,
+}
+
+/// Summary of a `FIX_BROWSER_SCRIPT kill` report, from its closing lines
+/// ("Found N process(es) on M host(s); K still running after kill." and
+/// "A host(s) clean, B unreachable ...").
+struct KillSummary {
+    found: usize,
+    hosts: usize,
+    remaining: usize,
+    clean: usize,
+    unreachable: usize,
+    auth_failed: bool,
+}
+
+fn parse_kill_summary(report: &str) -> KillSummary {
+    // Pull every integer out of a line, in order.
+    fn ints(line: &str) -> Vec<usize> {
+        line.split(|c: char| !c.is_ascii_digit())
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| s.parse().ok())
+            .collect()
+    }
+    let mut s = KillSummary {
+        found: 0,
+        hosts: 0,
+        remaining: 0,
+        clean: 0,
+        unreachable: 0,
+        auth_failed: report.contains("Permission denied"),
+    };
+    for line in report.lines() {
+        let line = line.trim();
+        if line.starts_with("Found ") && line.contains("still running after kill") {
+            let n = ints(line);
+            s.found = n.first().copied().unwrap_or(0);
+            s.hosts = n.get(1).copied().unwrap_or(0);
+            s.remaining = n.get(2).copied().unwrap_or(0);
+        } else if line.contains("host(s) clean") && line.contains("unreachable") {
+            let n = ints(line);
+            s.clean = n.first().copied().unwrap_or(0);
+            s.unreachable = n.get(1).copied().unwrap_or(0);
+        }
+    }
+    s
 }
 
 impl MyApp {
@@ -459,6 +515,7 @@ impl MyApp {
             scan_rx: None,
             scan_output: None,
             scan_window_open: false,
+            scan_window_kind: ScanWindowKind::Scan,
         };
         app.reload_ipts();
         app
@@ -604,6 +661,7 @@ impl MyApp {
                 if let Some(report) = firefox_remote_lock_report() {
                     self.scan_output = Some(report);
                     self.scan_window_open = true;
+                    self.scan_window_kind = ScanWindowKind::Scan;
                     self.launch_status = Some((
                         "Your browser is already running on another machine \
                          (see the report window)"
@@ -620,30 +678,91 @@ impl MyApp {
     }
 
     /// Run the maintenance script that kills stuck browser sessions.
+    ///
+    /// The script's output is captured and shown in the report window once
+    /// it finishes: users need to see whether anything was actually killed,
+    /// and on which machine — a silent run that reached no host (no SSH key
+    /// set up, hosts refusing the login) used to look exactly like success.
     fn kill_stuck_browsers(&mut self) {
-        match Command::new(FIX_BROWSER_SCRIPT).arg("kill").spawn() {
-            Ok(mut child) => {
-                // Reap the child in the background and signal the UI when it
-                // exits so the status message can be cleared.
-                let (tx, rx) = mpsc::channel();
-                thread::spawn(move || {
-                    let _ = child.wait();
-                    let _ = tx.send(());
-                });
-                self.cleanup_rx = Some(rx);
-                self.cleanup_msg = Some((
-                    "Killing stuck browser sessions\u{2026}".to_string(),
-                    theme::SUCCESS,
-                ));
-            }
-            Err(e) => {
-                self.cleanup_rx = None;
-                self.cleanup_msg = Some((
-                    format!("Failed to run {}: {}", FIX_BROWSER_SCRIPT, e),
-                    theme::DANGER,
-                ));
-            }
+        if self.cleanup_rx.is_some() {
+            return; // one kill run at a time
         }
+        if !Path::new(FIX_BROWSER_SCRIPT).is_file() {
+            self.cleanup_msg = Some((
+                format!("Missing script {}", FIX_BROWSER_SCRIPT),
+                theme::DANGER,
+            ));
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let report = match Command::new(FIX_BROWSER_SCRIPT)
+                .arg("kill")
+                .arg("-v")
+                .output()
+            {
+                Ok(out) => {
+                    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+                    let err = String::from_utf8_lossy(&out.stderr);
+                    if !err.trim().is_empty() {
+                        text.push_str("\n");
+                        text.push_str(err.trim_end());
+                    }
+                    text
+                }
+                Err(e) => format!("Could not run {}: {e}", FIX_BROWSER_SCRIPT),
+            };
+            let _ = tx.send(report);
+        });
+        self.cleanup_rx = Some(rx);
+        self.cleanup_msg = Some((
+            "Killing stuck browser sessions on the analysis machines\u{2026}".to_string(),
+            theme::WARNING,
+        ));
+    }
+
+    /// The kill run finished: summarise it next to the button and pop the
+    /// full report so the user sees what happened on which machine.
+    fn finish_kill_stuck_browsers(&mut self, report: String) {
+        let s = parse_kill_summary(&report);
+        let (msg, color) = if s.auth_failed {
+            (
+                "Could not log into the analysis machines (SSH refused) — see the report window"
+                    .to_string(),
+                theme::DANGER,
+            )
+        } else if s.found == 0 && s.clean == 0 && s.unreachable > 0 {
+            (
+                "No analysis machine could be reached — see the report window".to_string(),
+                theme::DANGER,
+            )
+        } else if s.found == 0 {
+            (
+                "No browser or Jupyter of yours found running on the analysis machines"
+                    .to_string(),
+                theme::SUCCESS,
+            )
+        } else if s.remaining == 0 {
+            (
+                format!(
+                    "Killed {} process(es) on {} machine(s) — you can launch again",
+                    s.found, s.hosts
+                ),
+                theme::SUCCESS,
+            )
+        } else {
+            (
+                format!(
+                    "{} process(es) still running after the kill — see the report window",
+                    s.remaining
+                ),
+                theme::DANGER,
+            )
+        };
+        self.cleanup_msg = Some((msg, color));
+        self.scan_output = Some(report);
+        self.scan_window_open = true;
+        self.scan_window_kind = ScanWindowKind::Kill;
     }
 
     /// Firefox failed to open: run `FIX_BROWSER_SCRIPT list -firefox` in a
@@ -658,6 +777,7 @@ impl MyApp {
         if let Some(report) = firefox_remote_lock_report() {
             self.scan_output = Some(report);
             self.scan_window_open = true;
+            self.scan_window_kind = ScanWindowKind::Scan;
             self.launch_status = Some((
                 format!("{why} — your browser is running on another machine (see the report window)"),
                 theme::DANGER,
@@ -714,6 +834,7 @@ impl MyApp {
         self.scan_rx = None;
         if scan_found_processes(&report) {
             self.scan_window_open = true;
+            self.scan_window_kind = ScanWindowKind::Scan;
             self.launch_status = Some((
                 "Your browser is already running on another machine (see the report window)"
                     .to_string(),
@@ -903,13 +1024,20 @@ impl eframe::App for MyApp {
                     }
                 });
 
-                // Clear the cleanup message once the script has finished.
+                // Report the kill run once the script has finished.
                 if let Some(rx) = &self.cleanup_rx {
-                    if rx.try_recv().is_ok() {
-                        self.cleanup_rx = None;
-                        self.cleanup_msg = None;
-                    } else {
-                        ctx.request_repaint_after(std::time::Duration::from_millis(200));
+                    match rx.try_recv() {
+                        Ok(report) => {
+                            self.cleanup_rx = None;
+                            self.finish_kill_stuck_browsers(report);
+                        }
+                        Err(mpsc::TryRecvError::Disconnected) => {
+                            self.cleanup_rx = None;
+                            self.cleanup_msg = None;
+                        }
+                        Err(mpsc::TryRecvError::Empty) => {
+                            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+                        }
                     }
                 }
 
@@ -1164,30 +1292,39 @@ impl eframe::App for MyApp {
         // ------------------------- browser-running-elsewhere scan report ---
         if self.scan_window_open {
             let mut open = true;
-            egui::Window::new("Browser already running elsewhere")
+            let kind = self.scan_window_kind;
+            let (title, intro, advice) = match kind {
+                ScanWindowKind::Scan => (
+                    "Browser already running elsewhere",
+                    "Firefox cannot open the notebook on this machine: \
+                     your browser profile is on shared storage and is \
+                     locked by a session on the machine(s) listed below.",
+                    "Click \u{1F527} Fix browser issue to close it from here, \
+                     or log into that machine and close the browser (and \
+                     any Jupyter) there, then launch again.",
+                ),
+                ScanWindowKind::Kill => (
+                    "Fix browser issue — result",
+                    "Your Firefox / Jupyter processes were looked for on \
+                     every analysis machine and killed where found. Machines \
+                     marked \"unreachable\" could not be logged into, so \
+                     nothing was checked or killed there.",
+                    "If your browser still refuses to open after this, log \
+                     into the listed machine and close it there.",
+                ),
+            };
+            egui::Window::new(title)
                 .open(&mut open)
                 .collapsible(false)
                 .resizable(true)
                 .default_size([680.0, 440.0])
                 .show(ctx, |ui| {
-                    ui.label(
-                        egui::RichText::new(
-                            "Firefox cannot open the notebook on this machine: \
-                             your browser profile is on shared storage and is \
-                             locked by a session on the machine(s) listed below.",
-                        )
-                        .size(16.0),
-                    );
+                    ui.label(egui::RichText::new(intro).size(16.0));
                     ui.add_space(4.0);
                     ui.label(
-                        egui::RichText::new(
-                            "Log into that machine and close the browser (and \
-                             any Jupyter) there, then launch again. Remote \
-                             kills are unreliable — closing it on the machine \
-                             itself is what works.",
-                        )
-                        .size(16.0)
-                        .color(theme::text_emphasis(ui.visuals())),
+                        egui::RichText::new(advice)
+                            .size(16.0)
+                            .color(theme::text_emphasis(ui.visuals())),
                     );
                     ui.add_space(8.0);
                     ui.separator();
