@@ -408,7 +408,7 @@ fn provision(app: &AppEntry, dest: &Path) -> Result<PathBuf, String> {
 
 fn main() -> eframe::Result {
     let mut options = eframe::NativeOptions::default();
-    options.viewport = options.viewport.with_inner_size(egui::vec2(880.0, 780.0));
+    options.viewport = options.viewport.with_inner_size(egui::vec2(1000.0, 780.0));
     eframe::run_native(
         &format!("{} General Tools", INSTRUMENTS[0].0),
         options,
