@@ -1107,14 +1107,12 @@ impl eframe::App for MyApp {
                 if resp.clicked() {
                     self.kill_stuck_browsers();
                 }
+                // The kill summary gets its own row under the buttons: painted
+                // next to the Fix button it ran into the centered Launch
+                // button, and a painter overlay reserves no panel height.
                 if let Some((msg, color)) = &self.cleanup_msg {
-                    ui.painter().text(
-                        btn_rect.right_center() + egui::vec2(8.0, 0.0),
-                        egui::Align2::LEFT_CENTER,
-                        msg,
-                        egui::TextStyle::Body.resolve(ui.style()),
-                        *color,
-                    );
+                    ui.add_space(4.0);
+                    ui.colored_label(*color, msg);
                 }
             });
 
