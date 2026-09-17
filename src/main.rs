@@ -12,11 +12,49 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
+use std::sync::OnceLock;
 use std::thread;
 use std::time::Instant;
 
 const JSON_PATH: &str =
     "/SNS/VENUS/shared/software/menu/list_marimo_general_users_applications.json";
+/// Application list of the beta portal: same format, but the entries point at
+/// the `marimo_notebooks_development` checkout (notebooks and marimo binary).
+const BETA_JSON_PATH: &str =
+    "/SNS/VENUS/shared/software/menu/list_marimo_beta_applications.json";
+
+/// Beta mode: the very same portal, serving the development notebooks. It is
+/// on when the portal is started with `--beta` or through a binary whose name
+/// ends in `_beta` (so the production binary never has to be replaced to
+/// deploy a beta).
+fn is_beta() -> bool {
+    static BETA: OnceLock<bool> = OnceLock::new();
+    *BETA.get_or_init(|| {
+        let mut args = std::env::args();
+        let exe_is_beta = args
+            .next()
+            .and_then(|exe| {
+                Path::new(&exe)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().ends_with("_beta"))
+            })
+            .unwrap_or(false);
+        exe_is_beta || args.any(|a| a == "--beta")
+    })
+}
+
+fn json_path() -> &'static str {
+    if is_beta() { BETA_JSON_PATH } else { JSON_PATH }
+}
+
+/// "<instrument> General Tools", tagged "(beta)" in beta mode.
+fn portal_title(instrument: &str) -> String {
+    if is_beta() {
+        format!("{instrument} General Tools (beta)")
+    } else {
+        format!("{instrument} General Tools")
+    }
+}
 /// Imaging instruments the portal can provision into:
 /// (display name, IPTS root, header logo). MARS is CG-1D at HFIR; it has no
 /// instrument-specific logo, so it uses the generic ORNL Neutron Imaging one.
@@ -168,10 +206,10 @@ impl Logo {
 }
 
 fn load_applications() -> Vec<(String, AppEntry)> {
-    let content = match fs::read_to_string(JSON_PATH) {
+    let content = match fs::read_to_string(json_path()) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Failed to read {}: {}", JSON_PATH, e);
+            eprintln!("Failed to read {}: {}", json_path(), e);
             return Vec::new();
         }
     };
@@ -310,11 +348,14 @@ fn list_ipts(root: &Path) -> Result<Vec<IptsEntry>, String> {
 }
 
 /// `<instrument root>/<ipts>/shared/notebooks/imaging_marimo_<user>`
+/// (`imaging_marimo_beta_<user>` in beta mode, so the development notebooks
+/// and their `utilities/` never overwrite the production copies).
 fn destination_for(ipts: &IptsEntry) -> PathBuf {
+    let prefix = if is_beta() { "imaging_marimo_beta" } else { "imaging_marimo" };
     ipts.path
         .join("shared")
         .join("notebooks")
-        .join(format!("imaging_marimo_{}", user_id()))
+        .join(format!("{prefix}_{}", user_id()))
 }
 
 /// Copy a directory tree, skipping cache folders.
@@ -410,7 +451,7 @@ fn main() -> eframe::Result {
     let mut options = eframe::NativeOptions::default();
     options.viewport = options.viewport.with_inner_size(egui::vec2(1000.0, 780.0));
     eframe::run_native(
-        &format!("{} General Tools", INSTRUMENTS[0].0),
+        &portal_title(INSTRUMENTS[0].0),
         options,
         Box::new(|cc| {
             cc.egui_ctx.set_theme(theme::load());
@@ -908,7 +949,9 @@ impl eframe::App for MyApp {
         egui::TopBottomPanel::top("header")
             .frame(
                 egui::Frame::new()
-                    .fill(theme::PRIMARY_RICH)
+                    // Orange banner in beta mode: it must never be mistaken
+                    // for the production portal.
+                    .fill(if is_beta() { theme::WARNING } else { theme::PRIMARY_RICH })
                     .inner_margin(egui::Margin {
                         left: 16,
                         right: 16,
@@ -920,7 +963,7 @@ impl eframe::App for MyApp {
                 ui.horizontal(|ui| {
                     // Title with a soft drop shadow: egui has no text shadow, so
                     // paint the text twice — a dark offset copy behind the white.
-                    let title = format!("{} General Tools", INSTRUMENTS[self.instrument].0);
+                    let title = portal_title(INSTRUMENTS[self.instrument].0);
                     let title = title.as_str();
                     let font = egui::FontId::proportional(28.0);
                     let shadow_offset = egui::vec2(2.0, 2.0);
