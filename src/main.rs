@@ -178,11 +178,12 @@ enum DisplayItem {
     Section(String, Vec<usize>),
 }
 
-/// An IPTS the current user can see under the instrument root.
+/// An IPTS the current user can work in under the instrument root: readable,
+/// with a `shared/` folder that accepts writes (we provision into
+/// `shared/notebooks/`). Other IPTS are left out of the list entirely.
 struct IptsEntry {
     label: String,
     path: PathBuf,
-    writable: bool,
 }
 
 /// A static logo image loaded into a texture, plus its aspect ratio for sizing.
@@ -316,9 +317,9 @@ fn user_id() -> String {
     std::env::var("USER").unwrap_or_else(|_| "user".to_string())
 }
 
-/// List the IPTS-* directories the user can read under `root`, sorted by number.
-/// An entry is `writable` when its `shared/` folder accepts writes (we provision
-/// into `shared/notebooks/marimo/`).
+/// List the IPTS-* directories under `root` the user can read and whose
+/// `shared/` folder accepts writes, sorted by number. IPTS the user cannot
+/// reach are not listed at all (rather than shown disabled).
 fn list_ipts(root: &Path) -> Result<Vec<IptsEntry>, String> {
     let dir = fs::read_dir(root).map_err(|e| format!("Cannot read {}: {e}", root.display()))?;
     let mut ipts: Vec<(u64, IptsEntry)> = Vec::new();
@@ -329,17 +330,15 @@ fn list_ipts(root: &Path) -> Result<Vec<IptsEntry>, String> {
             continue;
         };
         let path = entry.path();
-        if !can_access(&path) {
+        if !can_access(&path) || !can_write(&path.join("shared")) {
             continue;
         }
-        let writable = can_write(&path.join("shared"));
         let num: u64 = suffix.parse().unwrap_or(u64::MAX);
         ipts.push((
             num,
             IptsEntry {
                 label: name_str.into_owned(),
                 path,
-                writable,
             },
         ));
     }
@@ -1174,12 +1173,11 @@ impl eframe::App for MyApp {
                 if let Some(err) = &self.ipts_error {
                     ui.colored_label(theme::DANGER, err);
                 }
-                let writable_count = self.ipts_entries.iter().filter(|e| e.writable).count();
                 ui.colored_label(
                     theme::text_emphasis(ui.visuals()),
                     format!(
                         "You have write access to {} IPTS at {}",
-                        writable_count,
+                        self.ipts_entries.len(),
                         INSTRUMENTS[self.instrument].0
                     ),
                 );
@@ -1204,25 +1202,28 @@ impl eframe::App for MyApp {
                             let found = self
                                 .ipts_entries
                                 .iter()
-                                .enumerate()
-                                .find(|(_, e)| e.label == target)
-                                .map(|(idx, e)| (idx, e.writable));
+                                .position(|e| e.label == target);
                             match found {
-                                Some((idx, true)) => {
+                                Some(idx) => {
                                     self.ipts_selected = Some(idx);
                                     self.scroll_to_ipts = true;
                                     self.manual_ipts_msg = None;
                                     self.launch_status = None;
                                 }
-                                Some((_, false)) => {
-                                    self.manual_ipts_msg = Some((
-                                        format!("{} found but no write access", target),
-                                        theme::WARNING,
-                                    ));
-                                }
                                 None => {
-                                    self.manual_ipts_msg =
-                                        Some((format!("{} not found", target), theme::DANGER));
+                                    // Not listed: either the folder exists
+                                    // but the user cannot write to its
+                                    // shared/ (or read it), or it does not
+                                    // exist at all.
+                                    let root = Path::new(INSTRUMENTS[self.instrument].1);
+                                    self.manual_ipts_msg = if root.join(&target).exists() {
+                                        Some((
+                                            format!("{} found but no write access", target),
+                                            theme::WARNING,
+                                        ))
+                                    } else {
+                                        Some((format!("{} not found", target), theme::DANGER))
+                                    };
                                 }
                             }
                         }
@@ -1243,33 +1244,20 @@ impl eframe::App for MyApp {
                             .show(ui, |ui| {
                                 ui.set_width(ui.available_width());
                                 for i in 0..self.ipts_entries.len() {
-                                    let (label, writable) = {
-                                        let e = &self.ipts_entries[i];
-                                        (e.label.clone(), e.writable)
-                                    };
+                                    let label = self.ipts_entries[i].label.clone();
                                     let is_selected = self.ipts_selected == Some(i);
-                                    if writable {
-                                        let resp = ui.selectable_label(is_selected, &label);
-                                        if resp.clicked() {
-                                            self.ipts_selected = Some(i);
-                                            self.manual_ipts = label
-                                                .strip_prefix("IPTS-")
-                                                .unwrap_or("")
-                                                .to_string();
-                                            self.manual_ipts_msg = None;
-                                            self.launch_status = None;
-                                        }
-                                        if is_selected && self.scroll_to_ipts {
-                                            resp.scroll_to_me(Some(egui::Align::Center));
-                                        }
-                                    } else {
-                                        ui.add_enabled(
-                                            false,
-                                            egui::SelectableLabel::new(false, &label),
-                                        )
-                                        .on_disabled_hover_text(
-                                            "No write access to shared folder",
-                                        );
+                                    let resp = ui.selectable_label(is_selected, &label);
+                                    if resp.clicked() {
+                                        self.ipts_selected = Some(i);
+                                        self.manual_ipts = label
+                                            .strip_prefix("IPTS-")
+                                            .unwrap_or("")
+                                            .to_string();
+                                        self.manual_ipts_msg = None;
+                                        self.launch_status = None;
+                                    }
+                                    if is_selected && self.scroll_to_ipts {
+                                        resp.scroll_to_me(Some(egui::Align::Center));
                                     }
                                 }
                                 self.scroll_to_ipts = false;
